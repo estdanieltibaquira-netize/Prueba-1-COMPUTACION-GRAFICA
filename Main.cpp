@@ -173,6 +173,16 @@ int main()
 
 	float alphas[3] = { 0.7f, 0.4f, 1.0f }; //transparencia de cada triangulo: 0.7 = 30% transparente, 0.4 = 60% transparente, 1.0 = nada transparente
 
+	// ---- CAMARA CONTROLADA CON EL TECLADO ----
+	glm::vec3 cameraPos = glm::vec3(0.0f, 0.0f, 4.0f); //donde esta parada la camara (empieza un poco atras de los triangulos)
+	glm::vec3 cameraFront = glm::vec3(0.0f, 0.0f, -1.0f); //hacia donde mira la camara (empieza mirando hacia adentro de la pantalla, eje -Z)
+	glm::vec3 cameraUp = glm::vec3(0.0f, 1.0f, 0.0f); //cual es "arriba" para la camara
+	float yaw = -90.0f; //giro de la camara a izquierda/derecha, en grados (-90 = mirando hacia -Z)
+	float pitch = 0.0f; //giro de la camara hacia arriba/abajo, en grados
+
+	float deltaTime = 0.0f; //cuanto tardo el ultimo frame, sirve para que la camara se mueva igual de rapido en cualquier PC
+	float lastFrame = (float)glfwGetTime(); //momento en que se dibujo el frame anterior
+
 
 	/* Para evitar que se cierre la ventana necesitamos crear un bucle,
 	con la condicion que lav entana se cierre la condicion se dara cuando pulsemos el boton para que se cierre
@@ -186,11 +196,53 @@ int main()
 		glBindVertexArray(VAO);
 		float angulo = (float)glfwGetTime() * 90.0f; //segundos desde que arranco el programa, multiplicado por 50 para que gire mas rapido
 
-		float camAngulo = (float)glfwGetTime() * 8.0f; //grados que ha girado la camara (mas lento que los triangulos, para que se note bien)
-		float radio = 4.0f; //que tan lejos esta la camara del centro donde estan los triangulos
+		// ---- TECLADO ----
+		float currentFrame = (float)glfwGetTime(); //momento actual
+		deltaTime = currentFrame - lastFrame; //cuanto paso desde el frame anterior
+		lastFrame = currentFrame;
 
-		glm::vec3 camPos = glm::vec3(radio * sin(glm::radians(camAngulo)), 2.0f, radio * cos(glm::radians(camAngulo))); //posicion de la camara: se mueve en circulo alrededor del centro (0,0,0)
-		glm::mat4 view = glm::lookAt(camPos, glm::vec3(0.0f, 0.0f, 0.0f), glm::vec3(0.0f, 1.0f, 0.0f)); //la camara siempre mira hacia el centro, con "arriba" en Y
+		float velocidad = 2.5f * deltaTime; //cuanto se mueve la camara en este frame (unidades por segundo)
+		float velocidadGiro = 60.0f * deltaTime; //cuantos grados gira la camara en este frame
+
+		if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
+			glfwSetWindowShouldClose(window, true); //ESC cierra la ventana
+
+		// mover la camara (WASD)
+		if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS)
+			cameraPos += velocidad * cameraFront; //W: avanza hacia donde mira
+		if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS)
+			cameraPos -= velocidad * cameraFront; //S: retrocede
+		if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS)
+			cameraPos -= glm::normalize(glm::cross(cameraFront, cameraUp)) * velocidad; //A: se mueve a la izquierda (el cross da el vector "derecha")
+		if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS)
+			cameraPos += glm::normalize(glm::cross(cameraFront, cameraUp)) * velocidad; //D: se mueve a la derecha
+		if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS)
+			cameraPos += velocidad * cameraUp; //ESPACIO: sube
+		if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS)
+			cameraPos -= velocidad * cameraUp; //SHIFT: baja
+
+		// girar la camara (flechas)
+		if (glfwGetKey(window, GLFW_KEY_LEFT) == GLFW_PRESS)
+			yaw -= velocidadGiro; //flecha izquierda: mira a la izquierda
+		if (glfwGetKey(window, GLFW_KEY_RIGHT) == GLFW_PRESS)
+			yaw += velocidadGiro; //flecha derecha: mira a la derecha
+		if (glfwGetKey(window, GLFW_KEY_UP) == GLFW_PRESS)
+			pitch += velocidadGiro; //flecha arriba: mira hacia arriba
+		if (glfwGetKey(window, GLFW_KEY_DOWN) == GLFW_PRESS)
+			pitch -= velocidadGiro; //flecha abajo: mira hacia abajo
+
+		if (pitch > 89.0f) pitch = 89.0f; //limitamos el giro vertical para que la camara no de una vuelta de campana
+		if (pitch < -89.0f) pitch = -89.0f;
+
+		// con el yaw y el pitch calculamos hacia donde mira la camara (trigonometria basica)
+		glm::vec3 front;
+		front.x = cos(glm::radians(yaw)) * cos(glm::radians(pitch));
+		front.y = sin(glm::radians(pitch));
+		front.z = sin(glm::radians(yaw)) * cos(glm::radians(pitch));
+		cameraFront = glm::normalize(front);
+
+		// la camara esta en cameraPos y mira hacia cameraPos + cameraFront (un punto justo enfrente de ella)
+		glm::mat4 view = glm::lookAt(cameraPos, cameraPos + cameraFront, cameraUp);
 
 		glm::mat4 projection = glm::perspective(glm::radians(45.0f), 800.0f / 800.0f, 0.1f, 100.0f); //el "lente" de la camara: 45 grados de apertura, relacion ancho/alto de la ventana, y hasta donde alcanza a ver
 
@@ -205,7 +257,7 @@ int main()
 		{
 			glm::mat4 model = glm::mat4(1.0f); //matriz identidad, punto de partida sin ninguna transformacion
 			model = glm::translate(model, posiciones[i]); //la movemos al pivote de este triangulo
-			model = glm::rotate(model, glm::radians(angulo), glm::vec3(0.0f, 1.0f, 0.0f)); //la rotamos sobre el eje X
+			model = glm::rotate(model, glm::radians(angulo), glm::vec3(0.0f, 1.0f, 0.0f)); //la rotamos sobre el eje Y
 
 			glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "model"), 1, GL_FALSE, &model[0][0]); //mandamos la matriz al shader
 			glUniform1f(glGetUniformLocation(shaderProgram, "alpha"), alphas[i]); //mandamos la transparencia de este triangulo
