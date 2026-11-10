@@ -1,34 +1,169 @@
 #include<iostream>
+#include<fstream>
+#include<sstream>
+#include<vector>
+#include<string>
+#include<cmath>
 #include<glad/glad.h>
 #include<GLFW/glfw3.h>
 #include<glm/glm.hpp>
 #include<glm/gtc/matrix_transform.hpp>
-#define STB_IMAGE_IMPLEMENTATION //esto solo se pone UNA vez en todo el proyecto, aqui en el main
-#include <stb_image.h>
+
 //configurar shaders de OpenGL
-const char* vertexShaderSource = "#version 330 core\n" //le decimos a OpenGL que usamos GLSL version 3.30, perfil core
-"layout (location = 0) in vec3 aPos;\n" //aqui llega la posicion (x,y,z) de cada vertice, la misma que ya tenias
-"layout (location = 1) in vec2 aTexCoord;\n" //coordenada de textura de este vertice
-"out vec2 texCoord;\n" //se la pasamos al fragment shader
-"uniform mat4 model;\n" //matriz de 4x4 que vamos a mandar desde el codigo C++, "uniform" quiere decir que es un valor que le pasamos nosotros y que es igual para los 3 vertices en esa pasada (no cambia vertice por vertice como aPos)
-"uniform mat4 view;\n" //donde esta parada la camara y hacia donde mira
-"uniform mat4 projection;\n" //le da la perspectiva (como el lente de una camara real, con profundidad)
+const char* vertexShaderSource = "#version 330 core\n"
+"layout (location = 0) in vec3 aPos;\n" //posicion (x,y,z) de cada vertice
+"out vec3 fragPos;\n" //posicion en el mundo, la usamos para la luz falsa
+"uniform mat4 model;\n"
+"uniform mat4 view;\n"
+"uniform mat4 projection;\n"
 "void main()\n"
 "{\n"
-"   gl_Position = projection * view * model * vec4(aPos.x, aPos.y, aPos.z, 1.0);\n" //el orden importa: primero se mueve/rota el objeto (model), luego se ubica segun la camara (view), luego se le da la perspectiva (projection)
-"   texCoord = aTexCoord;\n" //la mandamos tal cual, sin transformar
+"   vec4 mundo = model * vec4(aPos, 1.0);\n"
+"   fragPos = mundo.xyz;\n"
+"   gl_Position = projection * view * mundo;\n" //model -> view -> projection
 "}\0";
 
-const char* fragmentShaderSource = "#version 330 core\n" //version de GLSL, igual que en el vertex shader
-"out vec4 FragColor;\n" //color final que va a salir pintado en pantalla
-"in vec2 texCoord;\n" //la coordenada que llego del vertex shader (ya interpolada)
-"uniform sampler2D tex0;\n" //la textura en si
-"uniform float alpha;\n" //transparencia que le vamos a mandar desde C++ para cada triangulo
+const char* fragmentShaderSource = "#version 330 core\n"
+"out vec4 FragColor;\n"
+"in vec3 fragPos;\n"
+"uniform vec3 colorBase;\n" //color del objeto
+"uniform float usarLuz;\n" //1.0 = sombrear el helicoptero, 0.0 = color plano (para la linea de la curva)
 "void main()\n"
 "{\n"
-"   vec4 texColor = texture(tex0, texCoord);\n" //sacamos el color de la imagen en ese pixel
-"   FragColor = vec4(texColor.rgb, texColor.a * alpha);\n" //el color viene de la imagen, el alpha se combina con el que ya tenias
+"   vec3 c = colorBase;\n"
+"   if (usarLuz > 0.5)\n"
+"   {\n"
+"      vec3 n = normalize(cross(dFdx(fragPos), dFdy(fragPos)));\n" //normal de cada cara calculada con derivadas
+"      float d = abs(dot(n, normalize(vec3(0.5, 1.0, 0.7))));\n" //luz falsa fija, solo para que se note el volumen
+"      c = colorBase * (0.35 + 0.65 * d);\n"
+"   }\n"
+"   FragColor = vec4(c, 1.0);\n"
 "}\n\0";
+
+
+// ---- CURVA DE BEZIER CUBICA ----
+// Se define con 4 puntos: P0 (inicio), P1 y P2 (puntos de control que "jalan" la curva) y P3 (final)
+// B(t) = (1-t)^3 * P0 + 3(1-t)^2 * t * P1 + 3(1-t) * t^2 * P2 + t^3 * P3 , con t entre 0 y 1
+glm::vec3 bezier(const glm::vec3* P, float t)
+{
+	float u = 1.0f - t;
+	return u * u * u * P[0] + 3.0f * u * u * t * P[1] + 3.0f * u * t * t * P[2] + t * t * t * P[3];
+}
+
+// La derivada de la curva da la direccion hacia donde "avanza" en cada punto (para que el helicoptero mire hacia adelante)
+glm::vec3 bezierTangente(const glm::vec3* P, float t)
+{
+	float u = 1.0f - t;
+	return 3.0f * u * u * (P[1] - P[0]) + 6.0f * u * t * (P[2] - P[1]) + 3.0f * t * t * (P[3] - P[2]);
+}
+
+
+// Una "parte" del modelo = un objeto/grupo del OBJ
+struct Parte
+{
+	std::string nombre;
+	GLuint VAO = 0, VBO = 0;
+	int cantidad = 0; //cuantos vertices tiene
+};
+
+// Carga un archivo .obj (el que exporta Maya) y lo deja listo para dibujar, un VAO por cada grupo
+bool cargarOBJ(const char* ruta, std::vector<Parte>& partes)
+{
+	std::ifstream archivo(ruta);
+	if (!archivo.is_open()) return false;
+
+	std::vector<glm::vec3> posiciones; //todos los vertices del archivo (lineas "v x y z")
+	std::vector<std::vector<float>> datos; //x,y,z de cada triangulo, separado por grupo
+	std::vector<std::string> nombres;
+	datos.push_back(std::vector<float>());
+	nombres.push_back("sin_nombre");
+
+	std::string linea;
+	while (std::getline(archivo, linea))
+	{
+		std::istringstream ss(linea);
+		std::string tipo;
+		ss >> tipo;
+		if (tipo == "v") //un vertice
+		{
+			float x, y, z;
+			ss >> x >> y >> z;
+			posiciones.push_back(glm::vec3(x, y, z));
+		}
+		else if (tipo == "o" || tipo == "g") //empieza un objeto o grupo nuevo
+		{
+			std::string nombre;
+			ss >> nombre;
+			if (!datos.back().empty()) { datos.push_back(std::vector<float>()); nombres.push_back(nombre); }
+			else nombres.back() = nombre;
+		}
+		else if (tipo == "f") //una cara, formato "f v/vt/vn v/vt/vn ..." (solo usamos el numero de vertice)
+		{
+			std::vector<int> idx;
+			std::string tok;
+			while (ss >> tok)
+			{
+				int i = std::stoi(tok.substr(0, tok.find('/')));
+				if (i < 0) i = (int)posiciones.size() + i + 1; //indices negativos cuentan desde el final
+				idx.push_back(i - 1);
+			}
+			for (size_t k = 1; k + 1 < idx.size(); k++) //si la cara tiene mas de 3 lados la partimos en triangulos
+			{
+				int tri[3] = { idx[0], idx[k], idx[k + 1] };
+				for (int j = 0; j < 3; j++)
+				{
+					if (tri[j] < 0 || tri[j] >= (int)posiciones.size()) continue;
+					glm::vec3 p = posiciones[tri[j]];
+					datos.back().push_back(p.x); datos.back().push_back(p.y); datos.back().push_back(p.z);
+				}
+			}
+		}
+	}
+	if (posiciones.empty()) return false;
+
+	// centramos todo el modelo en el origen y lo escalamos para que mida 1 unidad
+	glm::vec3 minimo(1e9f), maximo(-1e9f);
+	for (size_t k = 0; k < datos.size(); k++)
+		for (size_t i = 0; i + 2 < datos[k].size(); i += 3)
+		{
+			glm::vec3 v(datos[k][i], datos[k][i + 1], datos[k][i + 2]);
+			minimo = glm::min(minimo, v);
+			maximo = glm::max(maximo, v);
+		}
+	glm::vec3 centro = (minimo + maximo) * 0.5f;
+	glm::vec3 tamano = maximo - minimo;
+	float mayor = std::fmax(tamano.x, std::fmax(tamano.y, tamano.z));
+
+	for (size_t k = 0; k < datos.size(); k++)
+	{
+		if (datos[k].empty()) continue;
+		for (size_t i = 0; i + 2 < datos[k].size(); i += 3)
+		{
+			datos[k][i] = (datos[k][i] - centro.x) / mayor;
+			datos[k][i + 1] = (datos[k][i + 1] - centro.y) / mayor;
+			datos[k][i + 2] = (datos[k][i + 2] - centro.z) / mayor;
+		}
+
+		Parte parte;
+		parte.nombre = nombres[k];
+		parte.cantidad = (int)(datos[k].size() / 3);
+
+		// subimos la parte a la GPU: VAO + VBO con el formato (x,y,z), stride de 3 floats
+		glGenVertexArrays(1, &parte.VAO); //Recordar siempre generar primero el VAO y luego el VBO
+		glGenBuffers(1, &parte.VBO);
+		glBindVertexArray(parte.VAO);
+		glBindBuffer(GL_ARRAY_BUFFER, parte.VBO);
+		glBufferData(GL_ARRAY_BUFFER, datos[k].size() * sizeof(float), datos[k].data(), GL_STATIC_DRAW);
+		glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+		glEnableVertexAttribArray(0);
+		glBindBuffer(GL_ARRAY_BUFFER, 0);
+		glBindVertexArray(0);
+
+		std::cout << "Parte: " << parte.nombre << " (" << parte.cantidad << " vertices)" << std::endl;
+		partes.push_back(parte);
+	}
+	return !partes.empty();
+}
 
 
 int main()
@@ -40,19 +175,9 @@ int main()
 	//Para este caso el 3.3
 	glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
 	glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
-	// perfil de OPENGL que queremos usar , en este caso es el perfil de nucleo 
+	// perfil de OPENGL que queremos usar , en este caso es el perfil de nucleo
 	glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
-	GLfloat vertices[] =
-	{
-		// posiciones                                    // coordenadas de textura (u, v)
-		-0.5f, -0.5f * float(sqrt(3)) / 3, 0.0f,          0.0f, 0.0f, // Primer vertice (abajo izq.)
-		0.5f, -0.5f * float(sqrt(3)) / 3, 0.0f,           1.0f, 0.0f, // Segundo vertice (abajo der.)
-		0.0f, 0.5f * float(sqrt(3)) * 2 / 3, 0.0f,        0.5f, 1.0f  // Tercer vertice (arriba)
-	};
-
-
-	//para la ventana tomamaos datos de un tipo de ventana en GLFW y utilizamos una funcion para crear una ventana toma 5 entrandas (ancho, alto, "nombre", NULL, NULL)
 	GLFWwindow* window = glfwCreateWindow(800, 800, "Prueba 1", NULL, NULL);
 	//Comprobacion de errores en el caso de que la ventana no se cree
 	if (window == NULL)
@@ -62,224 +187,202 @@ int main()
 		glfwTerminate();
 		return -1;
 	}
-	//GLFW no entiende que si creamos una ventana es para usarla por eso se le indica que debe usarse
 	glfwMakeContextCurrent(window);
-
-	//Para darle color a la ventana le pedimos a glad que cargue las configuraiones necesarias para OPENGL
-
 	gladLoadGL();
+	glViewport(0, 0, 800, 800);
+	glEnable(GL_DEPTH_TEST); //para que lo que esta mas cerca tape a lo que esta mas lejos
 
-	// Indicamos el area de la ventana la cual queremos que OPENGL se renderice 
-	glViewport(0, 0, 800, 800); //indicandole (la parte izquierda de nuestra ventana (0,0,hasta la esquina superior derecha 800,800)
-
-	glEnable(GL_BLEND); //le decimos a OPENGL que active la mezcla de colores para las cosas transparentes
-	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); //la formula de esa mezcla: usa el alpha del color nuevo para decidir cuanto se ve el nuevo color y cuanto el que ya estaba pintado
-	glEnable(GL_DEPTH_TEST); //le dice a OPENGL que tenga en cuenta que hay cosas mas cerca o mas lejos de la camara, y las pinte en el orden correcto
-
-	GLuint vertexShader = glCreateShader(GL_VERTEX_SHADER); //Creamos un shader de tipo VERTEX SHADER y lo guardamos en una variable de tipo GLuint que es un entero posito en OPENGL
+	GLuint vertexShader = glCreateShader(GL_VERTEX_SHADER);
 	glShaderSource(vertexShader, 1, &vertexShaderSource, NULL);
-	/*
-	la GPU NO entiende el codigo fuente y toca compilarlo en codigo binario que la GPU si entiende,
-	para eso se usa esta funcion que toma 4 parametros(el shader que queremos compilar,
-	el numero de lineas de codigo fuente, el codigo fuente y NULL)
-	*/
 	glCompileShader(vertexShader);
-
 
 	GLuint fragmentShader = glCreateShader(GL_FRAGMENT_SHADER);
 	glShaderSource(fragmentShader, 1, &fragmentShaderSource, NULL);
 	glCompileShader(fragmentShader);
 
-	//para poder usar los shaders que hemos creado necesitamos encapsular en algo llamado programa shader
-	GLuint shaderProgram = glCreateProgram(); //creamos un programa shader y lo guardamos
-	// y para adjuntar un shader a un programa shader usamos la funcion glAttachShader
-
+	GLuint shaderProgram = glCreateProgram();
 	glAttachShader(shaderProgram, vertexShader);
 	glAttachShader(shaderProgram, fragmentShader);
 	glLinkProgram(shaderProgram);
 
-	//eliminamos los sombreadores que teniamos antes de crear el programa shader ya que no los necesitamos
 	glDeleteShader(vertexShader);
 	glDeleteShader(fragmentShader);
 
+	// ---- CARGAMOS EL HELICOPTERO ----
+	std::vector<Parte> partes;
+	if (!cargarOBJ("helicoptero.obj", partes)) //el archivo debe estar en la carpeta del proyecto (junto a Main.cpp)
+	{
+		std::cout << "No se pudo cargar helicoptero.obj" << std::endl;
+		glfwTerminate();
+		return -1;
+	}
+	std::cout << "Modelo cargado: " << partes.size() << " partes" << std::endl;
 
-	GLuint VAO, VBO;
+	// ---- LAS CURVAS DE BEZIER (cada una con sus 4 puntos en el espacio 3D) ----
+	glm::vec3 rutaHeli[4] = //camino del helicoptero
+	{
+		glm::vec3(-3.0f,  0.0f,  0.0f), //P0: inicio
+		glm::vec3(-1.0f,  3.0f, -4.0f), //P1: punto de control
+		glm::vec3(2.0f, -2.0f, -4.0f), //P2: punto de control
+		glm::vec3(4.0f,  1.0f,  0.0f)  //P3: final
+	};
+	glm::vec3 rutaCamara[4] = //camino de la camara cuando la ponemos a recorrer su propia curva
+	{
+		glm::vec3(-6.0f, 2.0f,  6.0f),
+		glm::vec3(-2.0f, 6.0f,  2.0f),
+		glm::vec3(4.0f, -1.0f,  6.0f),
+		glm::vec3(6.0f, 3.0f, -2.0f)
+	};
 
-	glGenVertexArrays(1, &VAO); //Recoadar siempre generar primero el VAO y luego el VBO, ya que el VAO es el que guarda la configuracion del VBO
-	glGenBuffers(1, &VBO);
-
-	glBindVertexArray(VAO); //Enlazamos VAO para poder trabajar con el
-
-	glBindBuffer(GL_ARRAY_BUFFER, VBO);
-	glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
-
-	glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)0); //posicion: 3 floats, empieza en el byte 0
+	// dibujamos la curva del helicoptero como una linea amarilla para ver el camino (50 puntos sobre la curva)
+	std::vector<float> datosCurva;
+	for (int i = 0; i <= 50; i++)
+	{
+		glm::vec3 p = bezier(rutaHeli, i / 50.0f);
+		datosCurva.push_back(p.x); datosCurva.push_back(p.y); datosCurva.push_back(p.z);
+	}
+	GLuint VAOcurva, VBOcurva;
+	glGenVertexArrays(1, &VAOcurva);
+	glGenBuffers(1, &VBOcurva);
+	glBindVertexArray(VAOcurva);
+	glBindBuffer(GL_ARRAY_BUFFER, VBOcurva);
+	glBufferData(GL_ARRAY_BUFFER, datosCurva.size() * sizeof(float), datosCurva.data(), GL_STATIC_DRAW);
+	glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
 	glEnableVertexAttribArray(0);
-
-	glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float), (void*)(3 * sizeof(float))); //textura: 2 floats, empieza despues de los 3 de posicion
-	glEnableVertexAttribArray(1);
-
 	glBindBuffer(GL_ARRAY_BUFFER, 0);
 	glBindVertexArray(0);
 
-	GLuint texture;
-	glGenTextures(1, &texture); //creamos un "espacio" para la textura, como hicimos con VAO/VBO
-	glBindTexture(GL_TEXTURE_2D, texture); //la enlazamos para trabajar con ella
+	// ---- CAMARA ----
+	glm::vec3 cameraPos = glm::vec3(0.0f, 2.0f, 8.0f);
+	glm::vec3 cameraFront = glm::vec3(0.0f, 0.0f, -1.0f);
+	glm::vec3 cameraUp = glm::vec3(0.0f, 1.0f, 0.0f);
+	float yaw = -90.0f;
+	float pitch = 0.0f;
+	bool camaraEnCurva = false; //false = camara libre con WASD, true = camara recorriendo su curva de Bezier mirando al helicoptero
+	bool teclaCAnterior = false; //para detectar un solo "click" de la tecla C
 
-	// como se repite/estira la textura si el triangulo pide mas area de la que hay imagen
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-	// como se ve la textura cuando esta muy cerca (MAG) o muy lejos (MIN) de la camara
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	float deltaTime = 0.0f;
+	float lastFrame = (float)glfwGetTime();
 
-	stbi_set_flip_vertically_on_load(true); //la imagen normalmente viene "al reves" para OPENGL, esto la voltea bien
-
-	int widthImg, heightImg, numColCh;
-	unsigned char* bytes = stbi_load("textura.jpg", &widthImg, &heightImg, &numColCh, 0); //carga la imagen del disco a memoria (cambia el nombre por el de tu imagen)
-
-	if (bytes)
-	{
-		GLenum formato = (numColCh == 4) ? GL_RGBA : GL_RGB; //si la imagen tiene canal alfa (png) usa RGBA, si no (jpg) usa RGB
-		glTexImage2D(GL_TEXTURE_2D, 0, formato, widthImg, heightImg, 0, formato, GL_UNSIGNED_BYTE, bytes); //le pasamos los pixeles a OPENGL
-		glGenerateMipmap(GL_TEXTURE_2D); //genera versiones mas pequeñas automaticamente, para cuando se vea de lejos
-	}
-	else
-	{
-		std::cout << "No se pudo cargar la textura" << std::endl;
-	}
-
-	stbi_image_free(bytes); //ya se la pasamos a la GPU, no necesitamos esta copia en RAM
-	glBindTexture(GL_TEXTURE_2D, 0);
-
-
-	/*aqui le indicamos a OPENGL que se prepare para borrar uun color de un buffer y darle otro color
-   (se le da color de la forma decimal normalizada del color RGB(0,0,0 y alfa(que se la tranparencia del color 1 es opaco 0 es transparente))
-   */
-	glClearColor(0.07f, 0.13f, 0.17f, 1.0f);
-	//ahora queremos que OPENGL ejecute el comando para el que le hemos indicado que se prepare usaremos esta funcion
-	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT); //ahora tambien limpiamos el buffer de profundidad en cada frame
-	//Aqui se intercambia el orden en el que se ven los buffers [hasta el momento se veia el color del buffer frontal] 
-	glfwSwapBuffers(window);
-
-	glm::vec3 posiciones[3] = //aqui guardamos el punto (centro/pivote) donde va a quedar y girar cada uno de los 3 triangulos
-	{
-		glm::vec3(-0.3f,  0.2f, 0.0f), //triangulo 1: arriba a la izquierda
-		glm::vec3(0.3f,  0.2f, 0.0f), //triangulo 2: arriba a la derecha
-		glm::vec3(0.0f, -0.3f, 0.0f)  //triangulo 3: abajo al centro
-	};
-
-	// (el arreglo de colores ya no se usa: el color de cada triangulo ahora sale de la textura, no de un color fijo)
-
-	float alphas[3] = { 0.7f, 0.4f, 1.0f }; //transparencia de cada triangulo: 0.7 = 30% transparente, 0.4 = 60% transparente, 1.0 = nada transparente
-
-	// ---- CAMARA CONTROLADA CON EL TECLADO ----
-	glm::vec3 cameraPos = glm::vec3(0.0f, 0.0f, 4.0f); //donde esta parada la camara (empieza un poco atras de los triangulos)
-	glm::vec3 cameraFront = glm::vec3(0.0f, 0.0f, -1.0f); //hacia donde mira la camara (empieza mirando hacia adentro de la pantalla, eje -Z)
-	glm::vec3 cameraUp = glm::vec3(0.0f, 1.0f, 0.0f); //cual es "arriba" para la camara
-	float yaw = -90.0f; //giro de la camara a izquierda/derecha, en grados (-90 = mirando hacia -Z)
-	float pitch = 0.0f; //giro de la camara hacia arriba/abajo, en grados
-
-	float deltaTime = 0.0f; //cuanto tardo el ultimo frame, sirve para que la camara se mueva igual de rapido en cualquier PC
-	float lastFrame = (float)glfwGetTime(); //momento en que se dibujo el frame anterior
-
-
-	/* Para evitar que se cierre la ventana necesitamos crear un bucle,
-	con la condicion que lav entana se cierre la condicion se dara cuando pulsemos el boton para que se cierre
-	*/
 	while (!glfwWindowShouldClose(window))
 	{
-
 		glClearColor(0.07f, 0.13f, 0.17f, 1.0f);
-		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT); //ahora tambien limpiamos el buffer de profundidad en cada frame
+		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 		glUseProgram(shaderProgram);
-		glBindVertexArray(VAO);
-		float angulo = (float)glfwGetTime() * 90.0f; //segundos desde que arranco el programa, multiplicado por 50 para que gire mas rapido
 
-		// ---- TECLADO ----
-		float currentFrame = (float)glfwGetTime(); //momento actual
-		deltaTime = currentFrame - lastFrame; //cuanto paso desde el frame anterior
+		float currentFrame = (float)glfwGetTime();
+		deltaTime = currentFrame - lastFrame;
 		lastFrame = currentFrame;
 
-		float velocidad = 2.5f * deltaTime; //cuanto se mueve la camara en este frame (unidades por segundo)
-		float velocidadGiro = 60.0f * deltaTime; //cuantos grados gira la camara en este frame
+		// ---- TECLADO ----
+		float velocidad = 2.5f * deltaTime;
+		float velocidadGiro = 60.0f * deltaTime;
 
 		if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS)
-			glfwSetWindowShouldClose(window, true); //ESC cierra la ventana
+			glfwSetWindowShouldClose(window, true);
 
-		// mover la camara (WASD)
+		// C: cambia entre camara libre y camara en la curva
+		bool teclaC = glfwGetKey(window, GLFW_KEY_C) == GLFW_PRESS;
+		if (teclaC && !teclaCAnterior)
+			camaraEnCurva = !camaraEnCurva;
+		teclaCAnterior = teclaC;
+
 		if (glfwGetKey(window, GLFW_KEY_W) == GLFW_PRESS)
-			cameraPos += velocidad * cameraFront; //W: avanza hacia donde mira
+			cameraPos += velocidad * cameraFront;
 		if (glfwGetKey(window, GLFW_KEY_S) == GLFW_PRESS)
-			cameraPos -= velocidad * cameraFront; //S: retrocede
+			cameraPos -= velocidad * cameraFront;
 		if (glfwGetKey(window, GLFW_KEY_A) == GLFW_PRESS)
-			cameraPos -= glm::normalize(glm::cross(cameraFront, cameraUp)) * velocidad; //A: se mueve a la izquierda (el cross da el vector "derecha")
+			cameraPos -= glm::normalize(glm::cross(cameraFront, cameraUp)) * velocidad;
 		if (glfwGetKey(window, GLFW_KEY_D) == GLFW_PRESS)
-			cameraPos += glm::normalize(glm::cross(cameraFront, cameraUp)) * velocidad; //D: se mueve a la derecha
+			cameraPos += glm::normalize(glm::cross(cameraFront, cameraUp)) * velocidad;
 		if (glfwGetKey(window, GLFW_KEY_SPACE) == GLFW_PRESS)
-			cameraPos += velocidad * cameraUp; //ESPACIO: sube
+			cameraPos += velocidad * cameraUp;
 		if (glfwGetKey(window, GLFW_KEY_LEFT_SHIFT) == GLFW_PRESS)
-			cameraPos -= velocidad * cameraUp; //SHIFT: baja
+			cameraPos -= velocidad * cameraUp;
 
-		// girar la camara (flechas)
 		if (glfwGetKey(window, GLFW_KEY_LEFT) == GLFW_PRESS)
-			yaw -= velocidadGiro; //flecha izquierda: mira a la izquierda
+			yaw -= velocidadGiro;
 		if (glfwGetKey(window, GLFW_KEY_RIGHT) == GLFW_PRESS)
-			yaw += velocidadGiro; //flecha derecha: mira a la derecha
+			yaw += velocidadGiro;
 		if (glfwGetKey(window, GLFW_KEY_UP) == GLFW_PRESS)
-			pitch += velocidadGiro; //flecha arriba: mira hacia arriba
+			pitch += velocidadGiro;
 		if (glfwGetKey(window, GLFW_KEY_DOWN) == GLFW_PRESS)
-			pitch -= velocidadGiro; //flecha abajo: mira hacia abajo
+			pitch -= velocidadGiro;
 
-		if (pitch > 89.0f) pitch = 89.0f; //limitamos el giro vertical para que la camara no de una vuelta de campana
+		if (pitch > 89.0f) pitch = 89.0f;
 		if (pitch < -89.0f) pitch = -89.0f;
 
-		// con el yaw y el pitch calculamos hacia donde mira la camara (trigonometria basica)
 		glm::vec3 front;
 		front.x = cos(glm::radians(yaw)) * cos(glm::radians(pitch));
 		front.y = sin(glm::radians(pitch));
 		front.z = sin(glm::radians(yaw)) * cos(glm::radians(pitch));
 		cameraFront = glm::normalize(front);
 
-		// la camara esta en cameraPos y mira hacia cameraPos + cameraFront (un punto justo enfrente de ella)
-		glm::mat4 view = glm::lookAt(cameraPos, cameraPos + cameraFront, cameraUp);
+		// ---- POSICION DEL HELICOPTERO SOBRE SU CURVA ----
+		// u va de 0 a 2 repetidamente: de 0 a 1 el helicoptero va de P0 a P3, de 1 a 2 regresa (ida y vuelta). 12 segundos por trayecto
+		float u = fmod(currentFrame / 12.0f, 2.0f);
+		float t = (u < 1.0f) ? u : 2.0f - u; //t es el parametro de la curva, siempre entre 0 y 1
+		float sentido = (u < 1.0f) ? 1.0f : -1.0f; //al regresar la direccion se invierte
+		glm::vec3 posHeli = bezier(rutaHeli, t);
+		glm::vec3 direccion = bezierTangente(rutaHeli, t) * sentido; //hacia donde avanza en este instante
+		float giroHeli = atan2(direccion.x, direccion.z); //angulo (eje Y) para que el helicoptero mire hacia donde avanza. Si tu modelo mira hacia otro lado, suma un offset (ej: + glm::radians(90.0f))
 
-		glm::mat4 projection = glm::perspective(glm::radians(45.0f), 800.0f / 800.0f, 0.1f, 100.0f); //el "lente" de la camara: 45 grados de apertura, relacion ancho/alto de la ventana, y hasta donde alcanza a ver
-
-		glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "view"), 1, GL_FALSE, &view[0][0]); //mandamos la camara al shader
-		glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "projection"), 1, GL_FALSE, &projection[0][0]); //mandamos la perspectiva al shader
-
-		glActiveTexture(GL_TEXTURE0); //activamos la "ranura" de textura 0
-		glBindTexture(GL_TEXTURE_2D, texture); //enlazamos nuestra textura ahi
-		glUniform1i(glGetUniformLocation(shaderProgram, "tex0"), 0); //le decimos al shader que "tex0" lea de esa ranura 0
-
-		for (int i = 0; i < 3; i++) //se repite 3 veces, una por cada triangulo
+		// ---- VIEW: camara libre o camara en la curva ----
+		glm::mat4 view;
+		if (camaraEnCurva)
 		{
-			glm::mat4 model = glm::mat4(1.0f); //matriz identidad, punto de partida sin ninguna transformacion
-			model = glm::translate(model, posiciones[i]); //la movemos al pivote de este triangulo
-			model = glm::rotate(model, glm::radians(angulo), glm::vec3(0.0f, 1.0f, 0.0f)); //la rotamos sobre el eje Y
-
-			glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "model"), 1, GL_FALSE, &model[0][0]); //mandamos la matriz al shader
-			glUniform1f(glGetUniformLocation(shaderProgram, "alpha"), alphas[i]); //mandamos la transparencia de este triangulo
-
-			glDrawArrays(GL_TRIANGLES, 0, 3); //dibujamos el triangulo con esa matriz, color y alpha ya puestos
+			float uc = fmod(currentFrame / 20.0f, 2.0f);
+			float tc = (uc < 1.0f) ? uc : 2.0f - uc;
+			glm::vec3 posCamCurva = bezier(rutaCamara, tc);
+			view = glm::lookAt(posCamCurva, posHeli, cameraUp); //la camara se mueve por su curva y siempre mira al helicoptero
 		}
+		else
+		{
+			view = glm::lookAt(cameraPos, cameraPos + cameraFront, cameraUp);
+		}
+		glm::mat4 projection = glm::perspective(glm::radians(45.0f), 800.0f / 800.0f, 0.1f, 100.0f);
+
+		glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "view"), 1, GL_FALSE, &view[0][0]);
+		glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "projection"), 1, GL_FALSE, &projection[0][0]);
+
+		// ---- DIBUJAMOS LA LINEA DE LA CURVA ----
+		glm::mat4 modelCurva = glm::mat4(1.0f);
+		glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "model"), 1, GL_FALSE, &modelCurva[0][0]);
+		glUniform1f(glGetUniformLocation(shaderProgram, "usarLuz"), 0.0f);
+		glUniform3f(glGetUniformLocation(shaderProgram, "colorBase"), 1.0f, 1.0f, 0.0f); //amarillo
+		glBindVertexArray(VAOcurva);
+		glDrawArrays(GL_LINE_STRIP, 0, (int)(datosCurva.size() / 3));
+
+		// ---- DIBUJAMOS EL HELICOPTERO ----
+		float escala = 1.5f; //tamano final del helicoptero (el modelo ya viene normalizado a 1 unidad)
+		glm::mat4 modelHeli = glm::mat4(1.0f);
+		modelHeli = glm::translate(modelHeli, posHeli); //lo movemos al punto de la curva
+		modelHeli = glm::rotate(modelHeli, giroHeli, glm::vec3(0.0f, 1.0f, 0.0f)); //lo giramos hacia donde avanza
+		modelHeli = glm::scale(modelHeli, glm::vec3(escala));
+		glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "model"), 1, GL_FALSE, &modelHeli[0][0]);
+		glUniform1f(glGetUniformLocation(shaderProgram, "usarLuz"), 1.0f);
+		glUniform3f(glGetUniformLocation(shaderProgram, "colorBase"), 0.75f, 0.75f, 0.75f); //gris
+		for (size_t k = 0; k < partes.size(); k++)
+		{
+			glBindVertexArray(partes[k].VAO);
+			glDrawArrays(GL_TRIANGLES, 0, partes[k].cantidad);
+		}
+
 		glfwSwapBuffers(window);
 		//Aqui se le dice a glfw que procese los eventos de la ventana SIN ESTO LA VENTANA NO RESPONDERA
 		glfwPollEvents();
-
-
 	}
 
-
-	glDeleteVertexArrays(1, &VAO);
-	glDeleteBuffers(1, &VBO);
-	glDeleteTextures(1, &texture);
+	for (size_t k = 0; k < partes.size(); k++)
+	{
+		glDeleteVertexArrays(1, &partes[k].VAO);
+		glDeleteBuffers(1, &partes[k].VBO);
+	}
+	glDeleteVertexArrays(1, &VAOcurva);
+	glDeleteBuffers(1, &VBOcurva);
 	glDeleteProgram(shaderProgram);
 
-	//Funcion para eliminar la ventana, pero hace que apenas se abra se cierre 
 	glfwDestroyWindow(window);
-	//Termina GLFW despues de finalizar el programa
 	glfwTerminate();
 	return 0;
 }
