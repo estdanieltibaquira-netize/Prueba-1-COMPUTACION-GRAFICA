@@ -4,6 +4,7 @@
 #include<vector>
 #include<string>
 #include<cmath>
+#include<algorithm>
 #include<glad/glad.h>
 #include<GLFW/glfw3.h>
 #include<glm/glm.hpp>
@@ -12,32 +13,50 @@
 //configurar shaders de OpenGL
 const char* vertexShaderSource = "#version 330 core\n"
 "layout (location = 0) in vec3 aPos;\n" //posicion (x,y,z) de cada vertice
-"out vec3 fragPos;\n" //posicion en el mundo, la usamos para la luz falsa
+"layout (location = 1) in vec3 aNormal;\n" //vector normal (nx,ny,nz) de cada vertice: es perpendicular a la superficie y sirve para calcular la luz
+"out vec3 FragPos;\n" //posicion del vertice en el mundo (se la mandamos al fragment shader)
+"out vec3 Normal;\n" //normal ya transformada al mundo (tambien se la mandamos al fragment shader)
 "uniform mat4 model;\n"
 "uniform mat4 view;\n"
 "uniform mat4 projection;\n"
+"uniform mat3 normalMatrix;\n" //matriz especial para las normales (la calculamos en C++, como recomiendan las diapositivas)
 "void main()\n"
 "{\n"
-"   vec4 mundo = model * vec4(aPos, 1.0);\n"
-"   fragPos = mundo.xyz;\n"
-"   gl_Position = projection * view * mundo;\n" //model -> view -> projection
+"   FragPos = vec3(model * vec4(aPos, 1.0));\n" //solo multiplicamos por model para quedar en coordenadas del mundo (los calculos de luz se hacen en el mundo)
+"   Normal = normalMatrix * aNormal;\n" //la normal NO se multiplica por model, se usa la matriz de normales
+"   gl_Position = projection * view * vec4(FragPos, 1.0);\n" //model -> view -> projection
 "}\0";
 
 const char* fragmentShaderSource = "#version 330 core\n"
-"out vec4 FragColor;\n"
-"in vec3 fragPos;\n"
+"out vec4 FragColor;\n" //color final del pixel
+"in vec3 FragPos;\n" //posicion del fragmento en el mundo (llega interpolada desde el vertex shader)
+"in vec3 Normal;\n" //normal del fragmento (tambien interpolada)
 "uniform vec3 colorBase;\n" //color del objeto
-"uniform float usarLuz;\n" //1.0 = sombrear el helicoptero, 0.0 = color plano (para la linea de la curva)
+"uniform float usarLuz;\n" //1.0 = aplicar iluminacion (helicoptero), 0.0 = color plano (la curva y la lampara)
+"uniform vec3 lightPos;\n" //posicion de la luz en el mundo
+"uniform vec3 lightColor;\n" //color de la luz
+"uniform vec3 viewPos;\n" //posicion de la camara en el mundo (la necesita la luz especular)
 "void main()\n"
 "{\n"
-"   vec3 c = colorBase;\n"
-"   if (usarLuz > 0.5)\n"
+"   if (usarLuz < 0.5)\n"
 "   {\n"
-"      vec3 n = normalize(cross(dFdx(fragPos), dFdy(fragPos)));\n" //normal de cada cara calculada con derivadas
-"      float d = abs(dot(n, normalize(vec3(0.5, 1.0, 0.7))));\n" //luz falsa fija, solo para que se note el volumen
-"      c = colorBase * (0.35 + 0.65 * d);\n"
+"      FragColor = vec4(colorBase, 1.0);\n" //sin luz: se pinta del color plano y se termina
+"      return;\n"
 "   }\n"
-"   FragColor = vec4(c, 1.0);\n"
+"   vec3 norm = normalize(Normal);\n" //siempre hay que normalizar los vectores en los calculos de luz (error comun si se olvida)
+"   vec3 viewDir = normalize(viewPos - FragPos);\n" //vector que va del fragmento hacia la camara
+"   if (dot(norm, viewDir) < 0.0) norm = -norm;\n" //si la normal apunta al lado contrario de la camara la volteamos (asi no se oscurecen las caras con orientacion rara)
+"   float ambientStrength = 0.2;\n" //que tan fuerte es la luz ambiental
+"   vec3 ambient = ambientStrength * lightColor;\n" //LUZ AMBIENTAL: un poquito de luz constante para que nada quede totalmente negro
+"   vec3 lightDir = normalize(lightPos - FragPos);\n" //vector que va del fragmento hacia la luz
+"   float diff = max(dot(norm, lightDir), 0.0);\n" //producto punto entre la normal y la luz; max evita valores negativos (caras de espaldas a la luz)
+"   vec3 diffuse = diff * lightColor;\n" //LUZ DIFUSA: mas brillo mientras mas de frente le llega la luz a la cara
+"   float specularStrength = 0.5;\n" //que tan fuerte es el reflejo
+"   vec3 reflectDir = reflect(-lightDir, norm);\n" //direccion en la que rebota la luz (reflect espera el vector de la luz hacia el fragmento, por eso el menos)
+"   float spec = pow(max(dot(viewDir, reflectDir), 0.0), 32.0);\n" //que tanto coincide el rebote con la mirada; 32 es el brillo (mas alto = punto de luz mas pequeno)
+"   vec3 specular = specularStrength * spec * lightColor;\n" //LUZ ESPECULAR: el punto brillante, del color de la luz
+"   vec3 result = (ambient + diffuse + specular) * colorBase;\n" //se suman las tres luces y se multiplican por el color del objeto
+"   FragColor = vec4(result, 1.0);\n"
 "}\n\0";
 
 
@@ -64,16 +83,27 @@ struct Parte
 	std::string nombre;
 	GLuint VAO = 0, VBO = 0;
 	int cantidad = 0; //cuantos vertices tiene
+	glm::vec3 centro = glm::vec3(0.0f); //centro de la parte: es el punto sobre el que giran las helices
 };
 
+// Dice si el nombre de una parte CONTIENE una palabra, sin importar mayusculas o minusculas
+// (asi funciona aunque Maya le agregue cosas al nombre, por ejemplo "heliceGrande_1")
+bool contiene(std::string nombre, std::string palabra)
+{
+	std::transform(nombre.begin(), nombre.end(), nombre.begin(), ::tolower); //todo a minusculas
+	std::transform(palabra.begin(), palabra.end(), palabra.begin(), ::tolower);
+	return nombre.find(palabra) != std::string::npos;
+}
+
 // Carga un archivo .obj (el que exporta Maya) y lo deja listo para dibujar, un VAO por cada grupo
+// Cada vertice queda guardado como: x, y, z, nx, ny, nz (posicion + normal), por eso el stride es de 6 floats
 bool cargarOBJ(const char* ruta, std::vector<Parte>& partes)
 {
 	std::ifstream archivo(ruta);
 	if (!archivo.is_open()) return false;
 
 	std::vector<glm::vec3> posiciones; //todos los vertices del archivo (lineas "v x y z")
-	std::vector<std::vector<float>> datos; //x,y,z de cada triangulo, separado por grupo
+	std::vector<std::vector<float>> datos; //x,y,z,nx,ny,nz de cada triangulo, separado por grupo
 	std::vector<std::string> nombres;
 	datos.push_back(std::vector<float>());
 	nombres.push_back("sin_nombre");
@@ -110,11 +140,20 @@ bool cargarOBJ(const char* ruta, std::vector<Parte>& partes)
 			for (size_t k = 1; k + 1 < idx.size(); k++) //si la cara tiene mas de 3 lados la partimos en triangulos
 			{
 				int tri[3] = { idx[0], idx[k], idx[k + 1] };
-				for (int j = 0; j < 3; j++)
+				if (tri[0] < 0 || tri[0] >= (int)posiciones.size() ||
+					tri[1] < 0 || tri[1] >= (int)posiciones.size() ||
+					tri[2] < 0 || tri[2] >= (int)posiciones.size()) continue; //si algun indice es invalido saltamos este triangulo
+
+				glm::vec3 p[3] = { posiciones[tri[0]], posiciones[tri[1]], posiciones[tri[2]] };
+
+				// VECTOR NORMAL: el producto vectorial de dos lados del triangulo da un vector perpendicular a la cara (el "truco" de las diapositivas)
+				glm::vec3 perpendicular = glm::cross(p[1] - p[0], p[2] - p[0]);
+				glm::vec3 normal = (glm::length(perpendicular) > 0.0f) ? glm::normalize(perpendicular) : glm::vec3(0.0f, 1.0f, 0.0f); //normalizamos para que mida 1 (si el triangulo es una linea, usamos "arriba")
+
+				for (int j = 0; j < 3; j++) //los 3 vertices del triangulo comparten la misma normal
 				{
-					if (tri[j] < 0 || tri[j] >= (int)posiciones.size()) continue;
-					glm::vec3 p = posiciones[tri[j]];
-					datos.back().push_back(p.x); datos.back().push_back(p.y); datos.back().push_back(p.z);
+					datos.back().push_back(p[j].x); datos.back().push_back(p[j].y); datos.back().push_back(p[j].z);
+					datos.back().push_back(normal.x); datos.back().push_back(normal.y); datos.back().push_back(normal.z);
 				}
 			}
 		}
@@ -124,7 +163,7 @@ bool cargarOBJ(const char* ruta, std::vector<Parte>& partes)
 	// centramos todo el modelo en el origen y lo escalamos para que mida 1 unidad
 	glm::vec3 minimo(1e9f), maximo(-1e9f);
 	for (size_t k = 0; k < datos.size(); k++)
-		for (size_t i = 0; i + 2 < datos[k].size(); i += 3)
+		for (size_t i = 0; i + 5 < datos[k].size(); i += 6) //saltamos de 6 en 6 porque cada vertice tiene 6 numeros
 		{
 			glm::vec3 v(datos[k][i], datos[k][i + 1], datos[k][i + 2]);
 			minimo = glm::min(minimo, v);
@@ -137,25 +176,37 @@ bool cargarOBJ(const char* ruta, std::vector<Parte>& partes)
 	for (size_t k = 0; k < datos.size(); k++)
 	{
 		if (datos[k].empty()) continue;
-		for (size_t i = 0; i + 2 < datos[k].size(); i += 3)
+		for (size_t i = 0; i + 5 < datos[k].size(); i += 6)
 		{
-			datos[k][i] = (datos[k][i] - centro.x) / mayor;
+			datos[k][i] = (datos[k][i] - centro.x) / mayor; //solo se mueve y escala la posicion, las normales se dejan igual
 			datos[k][i + 1] = (datos[k][i + 1] - centro.y) / mayor;
 			datos[k][i + 2] = (datos[k][i + 2] - centro.z) / mayor;
 		}
 
 		Parte parte;
 		parte.nombre = nombres[k];
-		parte.cantidad = (int)(datos[k].size() / 3);
+		parte.cantidad = (int)(datos[k].size() / 6);
 
-		// subimos la parte a la GPU: VAO + VBO con el formato (x,y,z), stride de 3 floats
+		// buscamos el centro de ESTA parte (punto medio entre su vertice mas chico y el mas grande)
+		glm::vec3 minParte(1e9f), maxParte(-1e9f);
+		for (size_t i = 0; i + 5 < datos[k].size(); i += 6)
+		{
+			glm::vec3 v(datos[k][i], datos[k][i + 1], datos[k][i + 2]);
+			minParte = glm::min(minParte, v);
+			maxParte = glm::max(maxParte, v);
+		}
+		parte.centro = (minParte + maxParte) * 0.5f;
+
+		// subimos la parte a la GPU: VAO + VBO con el formato (x,y,z,nx,ny,nz)
 		glGenVertexArrays(1, &parte.VAO); //Recordar siempre generar primero el VAO y luego el VBO
 		glGenBuffers(1, &parte.VBO);
 		glBindVertexArray(parte.VAO);
 		glBindBuffer(GL_ARRAY_BUFFER, parte.VBO);
 		glBufferData(GL_ARRAY_BUFFER, datos[k].size() * sizeof(float), datos[k].data(), GL_STATIC_DRAW);
-		glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+		glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)0); //posicion: 3 floats, empieza en el byte 0
 		glEnableVertexAttribArray(0);
+		glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * sizeof(float), (void*)(3 * sizeof(float))); //normal: 3 floats, empieza despues de los 3 de posicion
+		glEnableVertexAttribArray(1);
 		glBindBuffer(GL_ARRAY_BUFFER, 0);
 		glBindVertexArray(0);
 
@@ -205,6 +256,16 @@ int main()
 	glAttachShader(shaderProgram, fragmentShader);
 	glLinkProgram(shaderProgram);
 
+	// Si algun shader tiene un error de escritura, aqui nos lo dice en la consola (muy util cuando se toca la luz)
+	GLint compilo;
+	glGetProgramiv(shaderProgram, GL_LINK_STATUS, &compilo);
+	if (!compilo)
+	{
+		char registro[1024];
+		glGetProgramInfoLog(shaderProgram, 1024, NULL, registro);
+		std::cout << "Error en los shaders: " << registro << std::endl;
+	}
+
 	glDeleteShader(vertexShader);
 	glDeleteShader(fragmentShader);
 
@@ -217,6 +278,11 @@ int main()
 		return -1;
 	}
 	std::cout << "Modelo cargado: " << partes.size() << " partes" << std::endl;
+
+	// avisamos en la consola cuales partes se detectaron como helices (si no sale ninguna, el nombre en Maya es distinto)
+	for (size_t k = 0; k < partes.size(); k++)
+		if (contiene(partes[k].nombre, "heliceGrande") || contiene(partes[k].nombre, "heliceTraz"))
+			std::cout << "Helice detectada: " << partes[k].nombre << std::endl;
 
 	// ---- LAS CURVAS DE BEZIER (cada una con sus 4 puntos en el espacio 3D) ----
 	glm::vec3 rutaHeli[4] = //camino del helicoptero
@@ -251,6 +317,32 @@ int main()
 	glEnableVertexAttribArray(0);
 	glBindBuffer(GL_ARRAY_BUFFER, 0);
 	glBindVertexArray(0);
+
+	// ---- LA LAMPARA: un cubito que nos muestra donde esta la luz ----
+	float cubo[] = //36 vertices (6 caras x 2 triangulos x 3 vertices), solo posicion
+	{
+		-0.5f, -0.5f,  0.5f,   0.5f, -0.5f,  0.5f,   0.5f,  0.5f,  0.5f,   0.5f,  0.5f,  0.5f,  -0.5f,  0.5f,  0.5f,  -0.5f, -0.5f,  0.5f, //frente
+		-0.5f, -0.5f, -0.5f,  -0.5f,  0.5f, -0.5f,   0.5f,  0.5f, -0.5f,   0.5f,  0.5f, -0.5f,   0.5f, -0.5f, -0.5f,  -0.5f, -0.5f, -0.5f, //atras
+		-0.5f,  0.5f,  0.5f,  -0.5f,  0.5f, -0.5f,  -0.5f, -0.5f, -0.5f,  -0.5f, -0.5f, -0.5f,  -0.5f, -0.5f,  0.5f,  -0.5f,  0.5f,  0.5f, //izquierda
+		 0.5f,  0.5f,  0.5f,   0.5f, -0.5f, -0.5f,   0.5f,  0.5f, -0.5f,   0.5f, -0.5f, -0.5f,   0.5f,  0.5f,  0.5f,   0.5f, -0.5f,  0.5f, //derecha
+		-0.5f,  0.5f, -0.5f,  -0.5f,  0.5f,  0.5f,   0.5f,  0.5f,  0.5f,   0.5f,  0.5f,  0.5f,   0.5f,  0.5f, -0.5f,  -0.5f,  0.5f, -0.5f, //arriba
+		-0.5f, -0.5f, -0.5f,   0.5f, -0.5f, -0.5f,   0.5f, -0.5f,  0.5f,   0.5f, -0.5f,  0.5f,  -0.5f, -0.5f,  0.5f,  -0.5f, -0.5f, -0.5f  //abajo
+	};
+	GLuint VAOlampara, VBOlampara;
+	glGenVertexArrays(1, &VAOlampara);
+	glGenBuffers(1, &VBOlampara);
+	glBindVertexArray(VAOlampara);
+	glBindBuffer(GL_ARRAY_BUFFER, VBOlampara);
+	glBufferData(GL_ARRAY_BUFFER, sizeof(cubo), cubo, GL_STATIC_DRAW);
+	glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 3 * sizeof(float), (void*)0);
+	glEnableVertexAttribArray(0);
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+	glBindVertexArray(0);
+
+	// ---- LA LUZ ----
+	glm::vec3 lightPos = glm::vec3(0.0f, 5.0f, 4.0f); //donde esta la luz en el mundo (arriba y al frente del helicoptero)
+	glm::vec3 lightColor = glm::vec3(1.0f, 1.0f, 1.0f); //luz blanca
+	glm::vec3 colorHeli = glm::vec3(0.40f, 0.50f, 0.35f); //color del helicoptero (verde militar)
 
 	// ---- CAMARA ----
 	glm::vec3 cameraPos = glm::vec3(0.0f, 2.0f, 8.0f);
@@ -328,16 +420,18 @@ int main()
 		float giroHeli = atan2(direccion.x, direccion.z); //angulo (eje Y) para que el helicoptero mire hacia donde avanza. Si tu modelo mira hacia otro lado, suma un offset (ej: + glm::radians(90.0f))
 
 		// ---- VIEW: camara libre o camara en la curva ----
+		glm::vec3 posCamaraActual; //donde esta la camara en este momento (la luz especular necesita saberlo)
 		glm::mat4 view;
 		if (camaraEnCurva)
 		{
 			float uc = fmod(currentFrame / 20.0f, 2.0f);
 			float tc = (uc < 1.0f) ? uc : 2.0f - uc;
-			glm::vec3 posCamCurva = bezier(rutaCamara, tc);
-			view = glm::lookAt(posCamCurva, posHeli, cameraUp); //la camara se mueve por su curva y siempre mira al helicoptero
+			posCamaraActual = bezier(rutaCamara, tc);
+			view = glm::lookAt(posCamaraActual, posHeli, cameraUp); //la camara se mueve por su curva y siempre mira al helicoptero
 		}
 		else
 		{
+			posCamaraActual = cameraPos;
 			view = glm::lookAt(cameraPos, cameraPos + cameraFront, cameraUp);
 		}
 		glm::mat4 projection = glm::perspective(glm::radians(45.0f), 800.0f / 800.0f, 0.1f, 100.0f);
@@ -345,7 +439,12 @@ int main()
 		glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "view"), 1, GL_FALSE, &view[0][0]);
 		glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "projection"), 1, GL_FALSE, &projection[0][0]);
 
-		// ---- DIBUJAMOS LA LINEA DE LA CURVA ----
+		// le mandamos al shader los datos de la luz y de la camara
+		glUniform3f(glGetUniformLocation(shaderProgram, "lightPos"), lightPos.x, lightPos.y, lightPos.z);
+		glUniform3f(glGetUniformLocation(shaderProgram, "lightColor"), lightColor.x, lightColor.y, lightColor.z);
+		glUniform3f(glGetUniformLocation(shaderProgram, "viewPos"), posCamaraActual.x, posCamaraActual.y, posCamaraActual.z);
+
+		// ---- DIBUJAMOS LA LINEA DE LA CURVA (sin luz) ----
 		glm::mat4 modelCurva = glm::mat4(1.0f);
 		glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "model"), 1, GL_FALSE, &modelCurva[0][0]);
 		glUniform1f(glGetUniformLocation(shaderProgram, "usarLuz"), 0.0f);
@@ -353,17 +452,50 @@ int main()
 		glBindVertexArray(VAOcurva);
 		glDrawArrays(GL_LINE_STRIP, 0, (int)(datosCurva.size() / 3));
 
-		// ---- DIBUJAMOS EL HELICOPTERO ----
+		// ---- DIBUJAMOS LA LAMPARA (sin luz, siempre del color de la luz) ----
+		glm::mat4 modelLampara = glm::mat4(1.0f);
+		modelLampara = glm::translate(modelLampara, lightPos); //la ponemos donde esta la luz
+		modelLampara = glm::scale(modelLampara, glm::vec3(0.3f)); //cubito pequeno
+		glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "model"), 1, GL_FALSE, &modelLampara[0][0]);
+		glUniform3f(glGetUniformLocation(shaderProgram, "colorBase"), lightColor.x, lightColor.y, lightColor.z);
+		glBindVertexArray(VAOlampara);
+		glDrawArrays(GL_TRIANGLES, 0, 36);
+
+		// ---- DIBUJAMOS EL HELICOPTERO (con luz) ----
 		float escala = 1.5f; //tamano final del helicoptero (el modelo ya viene normalizado a 1 unidad)
 		glm::mat4 modelHeli = glm::mat4(1.0f);
 		modelHeli = glm::translate(modelHeli, posHeli); //lo movemos al punto de la curva
 		modelHeli = glm::rotate(modelHeli, giroHeli, glm::vec3(0.0f, 1.0f, 0.0f)); //lo giramos hacia donde avanza
 		modelHeli = glm::scale(modelHeli, glm::vec3(escala));
-		glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "model"), 1, GL_FALSE, &modelHeli[0][0]);
 		glUniform1f(glGetUniformLocation(shaderProgram, "usarLuz"), 1.0f);
-		glUniform3f(glGetUniformLocation(shaderProgram, "colorBase"), 0.75f, 0.75f, 0.75f); //gris
+		glUniform3f(glGetUniformLocation(shaderProgram, "colorBase"), colorHeli.x, colorHeli.y, colorHeli.z);
+
+		float giroHelice = currentFrame * 15.0f; //angulo de las helices: crece con el tiempo, asi que van girando (en radianes)
+
 		for (size_t k = 0; k < partes.size(); k++)
 		{
+			glm::mat4 modelParte = modelHeli; //cada parte parte del mismo model del helicoptero
+
+			// si la parte es una helice, la giramos sobre su propio centro: ir al centro -> girar -> volver
+			if (contiene(partes[k].nombre, "heliceGrande")) //la helice de arriba gira alrededor del eje Y
+			{
+				modelParte = glm::translate(modelParte, partes[k].centro);
+				modelParte = glm::rotate(modelParte, giroHelice, glm::vec3(0.0f, 1.0f, 0.0f));
+				modelParte = glm::translate(modelParte, -partes[k].centro);
+			}
+			else if (contiene(partes[k].nombre, "heliceTraz")) //la helice de la cola gira alrededor del eje X
+			{
+				modelParte = glm::translate(modelParte, partes[k].centro);
+				modelParte = glm::rotate(modelParte, giroHelice, glm::vec3(1.0f, 0.0f, 0.0f));
+				modelParte = glm::translate(modelParte, -partes[k].centro);
+			}
+
+			glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "model"), 1, GL_FALSE, &modelParte[0][0]);
+
+			// MATRIZ DE NORMALES: la transpuesta de la inversa de la parte 3x3 del model (asi las normales siguen perpendiculares aunque el objeto se mueva, rote o escale)
+			glm::mat3 normalMatrix = glm::transpose(glm::inverse(glm::mat3(modelParte)));
+			glUniformMatrix3fv(glGetUniformLocation(shaderProgram, "normalMatrix"), 1, GL_FALSE, &normalMatrix[0][0]);
+
 			glBindVertexArray(partes[k].VAO);
 			glDrawArrays(GL_TRIANGLES, 0, partes[k].cantidad);
 		}
@@ -380,6 +512,8 @@ int main()
 	}
 	glDeleteVertexArrays(1, &VAOcurva);
 	glDeleteBuffers(1, &VBOcurva);
+	glDeleteVertexArrays(1, &VAOlampara);
+	glDeleteBuffers(1, &VBOlampara);
 	glDeleteProgram(shaderProgram);
 
 	glfwDestroyWindow(window);
