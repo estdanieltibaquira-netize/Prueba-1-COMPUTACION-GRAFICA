@@ -83,7 +83,8 @@ struct Parte
 	std::string nombre;
 	GLuint VAO = 0, VBO = 0;
 	int cantidad = 0; //cuantos vertices tiene
-	glm::vec3 centro = glm::vec3(0.0f); //centro de la parte: es el punto sobre el que giran las helices
+	glm::vec3 minimo = glm::vec3(0.0f); //esquina mas chica de la parte (sirve para calcular el centro de las helices)
+	glm::vec3 maximo = glm::vec3(0.0f); //esquina mas grande de la parte
 };
 
 // Dice si el nombre de una parte CONTIENE una palabra, sin importar mayusculas o minusculas
@@ -123,7 +124,7 @@ bool cargarOBJ(const char* ruta, std::vector<Parte>& partes)
 		else if (tipo == "o" || tipo == "g") //empieza un objeto o grupo nuevo
 		{
 			std::string nombre;
-			ss >> nombre;
+			std::getline(ss, nombre); //leemos TODO el resto de la linea (Maya escribe varias palabras, ej: "g helicoptero heliceGrande pCube11")
 			if (!datos.back().empty()) { datos.push_back(std::vector<float>()); nombres.push_back(nombre); }
 			else nombres.back() = nombre;
 		}
@@ -195,7 +196,8 @@ bool cargarOBJ(const char* ruta, std::vector<Parte>& partes)
 			minParte = glm::min(minParte, v);
 			maxParte = glm::max(maxParte, v);
 		}
-		parte.centro = (minParte + maxParte) * 0.5f;
+		parte.minimo = minParte;
+		parte.maximo = maxParte;
 
 		// subimos la parte a la GPU: VAO + VBO con el formato (x,y,z,nx,ny,nz)
 		glGenVertexArrays(1, &parte.VAO); //Recordar siempre generar primero el VAO y luego el VBO
@@ -283,6 +285,25 @@ int main()
 	for (size_t k = 0; k < partes.size(); k++)
 		if (contiene(partes[k].nombre, "heliceGrande") || contiene(partes[k].nombre, "heliceTraz"))
 			std::cout << "Helice detectada: " << partes[k].nombre << std::endl;
+
+	// CENTRO DE CADA HELICE: cada helice esta hecha de varias piezas, asi que el centro se saca con TODAS sus piezas juntas
+	// (si cada pieza girara sobre su propio centro, las aspas se separarian)
+	glm::vec3 minGrande(1e9f), maxGrande(-1e9f), minTraz(1e9f), maxTraz(-1e9f);
+	for (size_t k = 0; k < partes.size(); k++)
+	{
+		if (contiene(partes[k].nombre, "heliceGrande"))
+		{
+			minGrande = glm::min(minGrande, partes[k].minimo);
+			maxGrande = glm::max(maxGrande, partes[k].maximo);
+		}
+		else if (contiene(partes[k].nombre, "heliceTraz"))
+		{
+			minTraz = glm::min(minTraz, partes[k].minimo);
+			maxTraz = glm::max(maxTraz, partes[k].maximo);
+		}
+	}
+	glm::vec3 centroGrande = (minGrande + maxGrande) * 0.5f; //punto sobre el que gira la helice de arriba
+	glm::vec3 centroTraz = (minTraz + maxTraz) * 0.5f; //punto sobre el que gira la helice de la cola
 
 	// ---- LAS CURVAS DE BEZIER (cada una con sus 4 puntos en el espacio 3D) ----
 	glm::vec3 rutaHeli[4] = //camino del helicoptero
@@ -476,18 +497,18 @@ int main()
 		{
 			glm::mat4 modelParte = modelHeli; //cada parte parte del mismo model del helicoptero
 
-			// si la parte es una helice, la giramos sobre su propio centro: ir al centro -> girar -> volver
+			// si la parte es una helice, la giramos sobre el centro de su helice: ir al centro -> girar -> volver
 			if (contiene(partes[k].nombre, "heliceGrande")) //la helice de arriba gira alrededor del eje Y
 			{
-				modelParte = glm::translate(modelParte, partes[k].centro);
+				modelParte = glm::translate(modelParte, centroGrande);
 				modelParte = glm::rotate(modelParte, giroHelice, glm::vec3(0.0f, 1.0f, 0.0f));
-				modelParte = glm::translate(modelParte, -partes[k].centro);
+				modelParte = glm::translate(modelParte, -centroGrande);
 			}
 			else if (contiene(partes[k].nombre, "heliceTraz")) //la helice de la cola gira alrededor del eje X
 			{
-				modelParte = glm::translate(modelParte, partes[k].centro);
+				modelParte = glm::translate(modelParte, centroTraz);
 				modelParte = glm::rotate(modelParte, giroHelice, glm::vec3(1.0f, 0.0f, 0.0f));
-				modelParte = glm::translate(modelParte, -partes[k].centro);
+				modelParte = glm::translate(modelParte, -centroTraz);
 			}
 
 			glUniformMatrix4fv(glGetUniformLocation(shaderProgram, "model"), 1, GL_FALSE, &modelParte[0][0]);
