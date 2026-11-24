@@ -2,8 +2,8 @@
 
 **Autor:** Daniel Tibaquira
 **Materia:** Computación Gráfica · Ingeniería Multimedia · Universidad Militar Nueva Granada
-**Docente:** Fernando J. Nossa 
-**Video explicativo:** \[https://youtu.be/h7GJDNDCFN4]
+**Docente:** Fernando J. Nossa Ch.
+**Video explicativo:** https://youtu.be/h7GJDNDCFN4
 
 ## Descripción
 
@@ -33,22 +33,63 @@ Escena 3D hecha con OpenGL 3.3 (C++). Un helicóptero cargado desde un archivo O
 
 ## Arquitectura del software
 
-```mermaid
-flowchart TD
-    A(\[Inicio]) --> B\["1. Ventana<br/>GLFW + GLAD"]
-    B --> C\["2. Shaders<br/>compilar y enlazar"]
-    C --> D\["3. Cargar modelo<br/>OBJ a VAO y VBO"]
-    D --> E\["4. Curvas y luz<br/>Bézier, lámpara, lightPos"]
-    E --> F{"Bucle principal<br/>cada fotograma"}
-    F --> G\["A. Entrada<br/>teclado y cámara"]
-    G --> H\["B. Movimiento<br/>posición en la curva"]
-    H --> I\["C. Uniforms<br/>luz y cámara al shader"]
-    I --> J\["D. Dibujar<br/>partes y hélices girando"]
-    J --> K\["GPU<br/>vertex shader y fragment shader"]
-    K --> L\["Pantalla<br/>swap de buffers"]
-    L --> F
-    F -->|se cierra la ventana| M\["5. Limpiar y cerrar"]
-    M --> N(\[Fin])
+Flujo del programa, de arriba hacia abajo. El bucle principal se repite hasta que se cierra la ventana.
+
+```text
+      INICIO
+        |
+        v
++---------------------------------------------------+
+| 1. VENTANA          GLFW + GLAD                   |
++---------------------------------------------------+
+        |
+        v
++---------------------------------------------------+
+| 2. SHADERS          compilar y enlazar            |
++---------------------------------------------------+
+        |
+        v
++---------------------------------------------------+
+| 3. CARGAR MODELO    OBJ a VAO y VBO               |
++---------------------------------------------------+
+        |
+        v
++---------------------------------------------------+
+| 4. CURVAS Y LUZ     Bézier, lámpara y luz         |
++---------------------------------------------------+
+        |
+        v
++===================================================+
+| BUCLE PRINCIPAL (se repite en cada fotograma)     |
+|                                                   |
+|   A. ENTRADA        teclado y cámara              |
+|        |                                          |
+|        v                                          |
+|   B. MOVIMIENTO     posición en la curva          |
+|        |                                          |
+|        v                                          |
+|   C. UNIFORMS       luz y cámara al shader        |
+|        |                                          |
+|        v                                          |
+|   D. DIBUJAR        partes y hélices girando      |
+|        |                                          |
+|        v                                          |
+|   GPU (shaders)                                   |
+|     E. Vertex shader      una vez por vértice     |
+|     F. Fragment shader    una vez por píxel (luz) |
+|     G. Pantalla           swap de buffers         |
+|        |                                          |
+|        +--> vuelve a A (siguiente fotograma)      |
++===================================================+
+        |
+        |  al cerrar la ventana
+        v
++---------------------------------------------------+
+| 5. LIMPIAR Y CERRAR   borrar buffers y cerrar     |
++---------------------------------------------------+
+        |
+        v
+      FIN
 ```
 
 ### Qué hace cada bloque
@@ -98,6 +139,3 @@ La normal de cada triángulo se calcula con el producto vectorial y se transform
 |`glad.c`|Cargador de OpenGL|
 |`libraries/`|Archivos de GLFW|
 |`Prueba 1.slnx` y `Prueba 1.vcxproj`|Proyecto de Visual Studio|
-
-
-
